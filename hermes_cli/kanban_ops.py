@@ -11,6 +11,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -27,6 +28,36 @@ def _kanban_config() -> dict:
         return (cfg.get("kanban", {}) if isinstance(cfg, dict) else {}) or {}
     except Exception:
         return {}
+
+
+def daemon_stuck_warning(
+    bad_ticks: int, res: Any,
+) -> str:
+    """The daemon's "ready queue non-empty, 0 spawned" warning line.
+
+    Cap-full (``has_cap_hold``) is healthy backpressure: the dispatcher is
+    deliberately spawning nothing, so the line must name the cap and must
+    NOT assert a spawn-path fault (venv/PATH/credentials). Kept as one
+    function so the CLI daemon and its tests share the exact wording.
+    """
+    held = kbd.describe_suppression([res])
+    held = f" Last tick held back: {held}." if held else ""
+    if kbd.has_cap_hold([res]):
+        return (
+            f"WARN dispatcher holding: ready queue non-empty for "
+            f"{bad_ticks} consecutive ticks and the dispatcher is "
+            f"deliberately spawning nothing — the concurrency cap is full"
+            f"{held} Raise kanban.max_in_progress (currently memory-derived or "
+            f"configured) or kanban.max_spawn to fan out further, or wait for "
+            f"running workers to finish."
+        )
+    return (
+        f"WARN dispatcher stuck: ready queue non-empty for "
+        f"{bad_ticks} consecutive ticks but 0 workers spawned "
+        f"successfully.{held} Check profile health (venv, PATH, credentials) and `hermes "
+        f"kanban list --status ready` / `hermes kanban list --status blocked` for "
+        f"recent spawn_failed tasks."
+    )
 
 
 def _poll_loop(interval: float, tick) -> int:
@@ -223,14 +254,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         if health_state["bad_ticks"] >= HEALTH_WINDOW:
             now = int(time.time())
             if now - health_state["last_warn_at"] >= 300:
-                held = kbd.describe_suppression([res])
-                held = f" Last tick held back: {held}." if held else ""
                 print(
-                    f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
-                    f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
-                    f"successfully.{held} Check profile health (venv, PATH, credentials) and `hermes "
-                    f"kanban list --status ready` / `hermes kanban list --status blocked` for "
-                    f"recent spawn_failed tasks.",
+                    f"[{_fmt_ts(now)}] {daemon_stuck_warning(health_state['bad_ticks'], res)}",
                     file=sys.stderr, flush=True,
                 )
                 health_state["last_warn_at"] = now

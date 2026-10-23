@@ -129,6 +129,19 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    capped_host: Optional[tuple[int, int]] = None
+    """``(cap, total_running)``: the HOST-level ``kanban.max_in_progress`` cap
+    was full this tick (running workers on this board + every other board), so
+    no worker was spawned. Healthy backpressure — NOT a spawn-path fault;
+    surfaces via :func:`describe_suppression` as ``host_cap=running/cap``."""
+    capped_board: Optional[tuple[int, int]] = None
+    """``(cap, running)``: the per-board ``max_spawn`` concurrency cap was full
+    this tick, so no worker was spawned on this board (``board_cap=running/cap``).
+    Same healthy-backpressure meaning as ``capped_host``."""
+    capped_profiles: list[tuple[str, int, int]] = field(default_factory=list)
+    """``(assignee, running, cap)`` per profiles that hit
+    ``kanban.max_in_progress_per_profile`` this tick (one entry per profile,
+    max ``running`` seen); surfaces as ``profile_cap=<assignee>=running/cap``."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -158,14 +171,18 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
     ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
-    memory_pressure=critical`` — the respawn-guard reasons counted per task
-    plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
-    CLI daemon and the embedded gateway dispatcher, which otherwise report a
-    bare zero-spawn count while ``hermes kanban tail`` is the only place the
-    guard reason is written (#111910).
+    memory_pressure=critical, host_cap=8/8, profile_cap=alice=3/2`` — the
+    respawn-guard reasons counted per task plus the tick-level holds (memory
+    pressure and the concurrency caps, ``running/cap``). Feeds the
+    "dispatcher stuck" warnings of the CLI daemon and the embedded gateway
+    dispatcher, which otherwise report a bare zero-spawn count while
+    ``hermes kanban tail`` is the only place the guard reason is written
+    (#111910).
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
+    caps: list[str] = []
+    seen: set[str] = set()
     for res in results:
         if res is None:
             continue
@@ -175,12 +192,53 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        # Pressure is a tick-level fact: the latest tick's snapshot wins
+        # (the caller's warning is about the most recent held state).
         if res.memory_pressure:
             pressure = res.memory_pressure
+        # Cap holds span boards: one board at cap-full must not be hidden
+        # by a sibling board with headroom (same host budget).
+        for marker in _cap_hold_markers(res):
+            if marker not in seen:
+                seen.add(marker)
+                caps.append(marker)
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
+    parts.extend(caps)
     return ", ".join(parts)
+
+
+def _cap_hold_markers(res: "DispatchResult") -> list[str]:
+    """This tick's cap-hold markers, e.g. ``["host_cap=8/8"]`` or
+    ``["profile_cap=alice=3/2"]`` (``running/cap``)."""
+    markers: list[str] = []
+    if res.capped_host is not None:
+        markers.append(f"host_cap={res.capped_host[1]}/{res.capped_host[0]}")
+    if res.capped_board is not None:
+        markers.append(f"board_cap={res.capped_board[1]}/{res.capped_board[0]}")
+    seen: set[str] = set()
+    for assignee, running, cap in res.capped_profiles:
+        if assignee in seen:
+            continue
+        seen.add(assignee)
+        markers.append(f"profile_cap={assignee}={running}/{cap}")
+    return markers
+
+
+def has_cap_hold(results: Iterable[Optional["DispatchResult"]]) -> bool:
+    """True when any tick was held by a concurrency cap (host / board / per-profile).
+
+    A cap-hold tick is healthy backpressure — the dispatcher is doing exactly
+    the right thing — so the "dispatcher stuck" warning must not assert a
+    spawn-path fault (venv/PATH/credentials) for it.
+    """
+    for res in results:
+        if res is None:
+            continue
+        if res.capped_host is not None or res.capped_board is not None or res.capped_profiles:
+            return True
+    return False
 
 
 # Bounded registry of recently-reaped worker exits, filled by the reap loop in
@@ -2069,6 +2127,13 @@ def _dispatch_lane_task(
         current = per_profile_running.get(assignee, 0)
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
+            # Tick-level marker (one entry per profile, max running seen) so
+            # the "dispatcher stuck" warning can name the busy profile.
+            for _a, _r, _c in result.capped_profiles:
+                if _a == assignee and _r >= current:
+                    break
+            else:
+                result.capped_profiles.append((assignee, current, per_profile_cap))
             return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
@@ -2229,19 +2294,29 @@ def _tick_spawn_budget(
     if max_spawn is not None or max_in_progress is not None:
         running_count = count_running_tasks(conn)
 
-    # Both ready and review loops consume from the same budget.
+    # Both ready and review loops consume from the same budget. A FULL cap is
+    # healthy backpressure, not a fault — record the hold so the "dispatcher
+    # stuck" warning can self-explain (``describe_suppression``) instead of
+    # pointing at venv/PATH/credentials.
+    cap_hold = False
     if max_spawn is not None:
         if running_count >= max_spawn:
-            return False, None
-        spawn_budget = max_spawn - running_count
+            result.capped_board = (max_spawn, running_count)
+            cap_hold = True
+        else:
+            spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
-            return False, None
-        remaining = max_in_progress - total_running
-        if spawn_budget is None or spawn_budget > remaining:
-            spawn_budget = remaining
+            result.capped_host = (max_in_progress, total_running)
+            cap_hold = True
+        else:
+            remaining = max_in_progress - total_running
+            if spawn_budget is None or spawn_budget > remaining:
+                spawn_budget = remaining
+    if cap_hold:
+        return False, None
 
     # Memory-pressure guard: a static cap can't see the host's actual state.
     # critical -> spawn nothing this tick; elevated -> at most one new worker.
