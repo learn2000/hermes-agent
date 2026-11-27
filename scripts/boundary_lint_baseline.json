@@ -165,6 +165,8 @@
     "plugins/image_gen/xai/__init__.py tools.xai_http.read_xai_imagine_storage_config": 1,
     "plugins/image_gen/xai/__init__.py tools.xai_http.resolve_xai_http_credentials": 1,
     "plugins/image_gen/xai/__init__.py tools.xai_http.xai_storage_notice_text": 1,
+    "plugins/kanban/dashboard/log_transcript.py hermes_cli.kanban_db": 2,
+    "plugins/kanban/dashboard/log_transcript.py hermes_cli.profiles.get_profile_dir": 1,
     "plugins/kanban/dashboard/plugin_api.py agent.auxiliary_client.call_llm": 1,
     "plugins/kanban/dashboard/plugin_api.py agent.portal_tags.get_affinity_scope": 1,
     "plugins/kanban/dashboard/plugin_api.py agent.portal_tags.reset_affinity_scope": 1,

@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.util
 import json
 import logging
 import re
 import sqlite3
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
@@ -41,6 +43,40 @@ from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_pa
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _load_sibling(filename: str):
+    """Import a module that sits next to this file.
+
+    The dashboard mounts this plugin by importing ``plugin_api.py`` from its path under a
+    flat module name (no parent package), so a relative import cannot work. Loading the
+    sibling by path also keeps a single module object whatever the mount path was.
+    """
+    name = f"{__name__}__{Path(filename).stem}"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parent / filename)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load sibling module {filename!r}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+try:
+    # Worker-log transcript reconstruction (see the module docstring) — kept out of this
+    # file so the route stays a thin wrapper and the plugin's line budget stays flat.
+    # Optional on purpose: a missing helper must degrade to the file-backed log, never
+    # take the whole plugin mount down with it.
+    log_transcript = _load_sibling("log_transcript.py")
+except Exception:  # a broken helper must degrade, not break the mount
+    log.warning("kanban worker-log transcript helper unavailable", exc_info=True)
+    log_transcript = None
 
 _BOARD_Q = Query(None, description="Kanban board slug (omit for current)")
 
@@ -1253,15 +1289,28 @@ def get_assignees(board: Optional[str] = Query(None)):
 @router.get("/tasks/{task_id}/log")
 def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_000), board: Optional[str] = Query(None)):
     """Worker stdout/stderr log. ``tail`` caps the response bytes; 404 if the
-    task never spawned. On-disk log rotates at 2 MiB with one ``.log.1`` kept."""
+    task never spawned. On-disk log rotates at 2 MiB with one ``.log.1`` kept.
+
+    When the file holds only run-boundary lines (``Session:``/``[kanban-worker-exit]``)
+    the worker's frames never reached it, so the transcript is rebuilt from the
+    profile's ``state.db``; ``source`` reports which content the caller got, while
+    ``path``/``size_bytes`` always describe the file."""
     with _board_conn(board) as (board, conn):
-        _require_task(conn, task_id)
+        task = _require_task(conn, task_id)
+        if log_transcript is not None:
+            # One guarded entry point: the helper owns the file read, the rebuild and every
+            # fallback, so a helper that loaded but drifted afterwards (post-load skew) can
+            # only degrade this route to the file payload — never 500 it.
+            return log_transcript.log_payload(
+                task_id=task_id, task=task, tail=tail, conn=conn, board=board)
+    # Helper module missing: today's body, verbatim.
     content = kanban_db.read_worker_log(task_id, tail_bytes=tail, board=board)
     log_path = kanban_db.worker_log_path(task_id, board=board)
     size = log_path.stat().st_size if log_path.exists() else 0
     return {
         "task_id": task_id, "path": str(log_path), "exists": content is not None,
-        "size_bytes": size, "content": content or "", "truncated": bool(tail and size > tail)}
+        "size_bytes": size, "content": content or "", "truncated": bool(tail and size > tail),
+        "source": "log_file"}
 
 
 @router.post("/dispatch")
