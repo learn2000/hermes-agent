@@ -4,6 +4,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import { Dialog, DialogContent } from './dialog'
 import {
+  CONTEXT_MENU_KEEP_FOCUS_ATTR,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -132,6 +133,62 @@ describe('DropdownMenuSearch hover focus', () => {
 
     hover(row)
     expect(row.ownerDocument.activeElement).toBe(row)
+  })
+})
+
+// The app context menu on a form field marks the field while the menu is up:
+// an unfocused input or textarea paints no selection, so hover must not take
+// the caret the way it does everywhere else.
+describe('DropdownMenu row hover with a marked form field', () => {
+  function menuWithField(marked: boolean) {
+    // Focus the field before the menu mounts, like a right-click inside it:
+    // the menu is told to leave the mount autofocus alone, and the field is
+    // still focused when the pointer reaches a row.
+    const field = document.createElement('input')
+
+    document.body.appendChild(field)
+    field.focus()
+
+    if (marked) {
+      field.setAttribute(CONTEXT_MENU_KEEP_FOCUS_ATTR, '')
+    }
+
+    render(
+      <DropdownMenu open>
+        <DropdownMenuContent onOpenAutoFocus={(event: Event) => event.preventDefault()}>
+          <DropdownMenuItem>Row</DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    )
+
+    return { field, row: screen.getByRole('menuitem', { name: 'Row' }) }
+  }
+
+  it('keeps focus in the marked field, and highlights the row anyway', () => {
+    const { field, row } = menuWithField(true)
+
+    expect(field.ownerDocument.activeElement).toBe(field)
+
+    hover(row)
+    expect(field.ownerDocument.activeElement).toBe(field)
+    expect(row.hasAttribute('data-highlighted')).toBe(true)
+
+    unhover(row)
+    expect(field.ownerDocument.activeElement).toBe(field)
+    expect(row.hasAttribute('data-highlighted')).toBe(false)
+
+    field.remove()
+  })
+
+  it('leaves an unmarked field to Radix hover-to-focus', () => {
+    const { field, row } = menuWithField(false)
+
+    expect(field.ownerDocument.activeElement).toBe(field)
+
+    hover(row)
+    expect(field.ownerDocument.activeElement).toBe(row)
+
+    field.remove()
   })
 })
 

@@ -9,6 +9,7 @@ import { DROPDOWN_KIT } from '@/components/ui/actions-menu'
 import { Codicon } from '@/components/ui/codicon'
 import { HERMES_CONTEXT_MENU_TRIGGER_ATTR } from '@/components/ui/context-menu'
 import {
+  CONTEXT_MENU_KEEP_FOCUS_ATTR,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -140,6 +141,29 @@ function leaveRowTextFieldToBrowser(event: MouseEvent, element: Element | null) 
   if (typed) {
     leaveEditableToBrowser(event, resolveDomTarget(element))
   }
+}
+
+/** Keys the open menu owns while a form field keeps focus: caret keys and Tab
+ *  would collapse the visible selection or walk focus out of the field, and
+ *  Enter would submit the dialog sitting behind the menu. */
+const FIELD_KEEP_FOCUS_SWALLOWED_KEYS = new Set([
+  'ArrowDown',
+  'ArrowLeft',
+  'ArrowRight',
+  'ArrowUp',
+  'End',
+  'Enter',
+  'Home',
+  'PageDown',
+  'PageUp',
+  'Tab'
+])
+
+/** A form field paints its selection only while the field itself holds focus
+ *  (a contenteditable's selection is a document Range, painted either way),
+ *  so only these need the menu to leave focus alone. */
+function isFormField(element: HTMLElement | null): element is HTMLInputElement | HTMLTextAreaElement {
+  return element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
 }
 
 function isLoopbackUrl(url: string): boolean {
@@ -678,6 +702,16 @@ export function AppContextMenu() {
   const composerContributions = useContributions(COMPOSER_AREAS.contextMenu)
   const composerTarget = open?.kind === 'dom' ? open.target.composer : null
 
+  // The form field the open menu must keep focused. Read at render: the render
+  // that opens the menu runs while the field still holds focus (the click put
+  // it there, and the menu's own autofocus only happens after this commit).
+  // Only a field that already held focus has a painted selection to keep;
+  // every other target keeps the menu's own focus behavior.
+  const keepFocusTarget =
+    open?.kind === 'dom' && isFormField(open.target.editable) && document.activeElement === open.target.editable
+      ? open.target.editable
+      : null
+
   // Resolved once per right-click (the target is captured at open and kept
   // across the late spell-check update), and again only if a plugin
   // registers or unloads while the menu is up.
@@ -784,6 +818,54 @@ export function AppContextMenu() {
   // them on its own context-menu event); attach them to the open menu.
   useEffect(() => window.hermesDesktop?.onContextMenuSpellcheck?.(augmentSpellcheck), [])
 
+  // While the menu keeps focus in the field, mark the field so the kit's row
+  // hover gate leaves the caret there (a row that focuses itself would take
+  // the painted selection with it) and hold the keys the menu owns.
+  useEffect(() => {
+    if (!keepFocusTarget) {
+      return
+    }
+
+    keepFocusTarget.setAttribute(CONTEXT_MENU_KEEP_FOCUS_ATTR, '')
+
+    return () => keepFocusTarget.removeAttribute(CONTEXT_MENU_KEEP_FOCUS_ATTR)
+  }, [keepFocusTarget])
+
+  useEffect(() => {
+    if (!keepFocusTarget) {
+      return
+    }
+
+    // Escape still closes the menu, but nothing below the menu may see the
+    // key: the dialog behind it would close too, and a field's own Escape
+    // handler would run. The caret keys, Tab and Enter would collapse the
+    // visible selection, walk focus out of the field, or submit the dialog.
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.isComposing) {
+        return
+      }
+
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        event.stopPropagation()
+        closeContextMenu()
+
+        return
+      }
+
+      if (!FIELD_KEEP_FOCUS_SWALLOWED_KEYS.has(event.key)) {
+        return
+      }
+
+      event.preventDefault()
+      event.stopPropagation()
+    }
+
+    document.addEventListener('keydown', onKeyDown, true)
+
+    return () => document.removeEventListener('keydown', onKeyDown, true)
+  }, [keepFocusTarget])
+
   if (!open) {
     return null
   }
@@ -823,6 +905,9 @@ export function AppContextMenu() {
         align="start"
         className="w-56"
         onCloseAutoFocus={event => event.preventDefault()}
+        // Radix runs this before its own content focus; cancelling it leaves
+        // focus in the field, which is what keeps the selection painted.
+        onOpenAutoFocus={keepFocusTarget ? (event: Event) => event.preventDefault() : undefined}
         portalContainer={open.kind === 'dom' ? open.target.dialogPortalContainer : undefined}
         side="bottom"
       >
