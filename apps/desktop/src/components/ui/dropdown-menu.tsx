@@ -38,6 +38,25 @@ function searchHoldsFocus(row: HTMLElement): boolean {
   )
 }
 
+/** Marks the form field a menu must keep focused. The app sets it while its
+ *  context menu is open on an `<input>`/`<textarea>`: those paint their
+ *  selection only while the field itself holds focus, so a hover that stole it
+ *  would hide the user's highlight. Exported for the app — the kit never
+ *  imports the app, only reads this attribute off the focused element. */
+export const CONTEXT_MENU_KEEP_FOCUS_ATTR = 'data-context-menu-keep-focus'
+
+/** The same theft, from a form field outside the menu: while the app menu is
+ *  open on a focused field, rows must not take the caret from it. */
+function markedFieldHoldsFocus(row: HTMLElement): boolean {
+  const active = row.ownerDocument.activeElement
+
+  return Boolean(active?.hasAttribute(CONTEXT_MENU_KEEP_FOCUS_ATTR) && row.closest('[role="menu"]'))
+}
+
+function rowMustKeepFocus(row: HTMLElement): boolean {
+  return searchHoldsFocus(row) || markedFieldHoldsFocus(row)
+}
+
 const searchHoverClass = 'data-[highlighted]:bg-(--ui-control-active-background) data-[highlighted]:text-foreground'
 
 type RowPointerHandlers = Pick<React.HTMLAttributes<HTMLDivElement>, 'onPointerLeave' | 'onPointerMove'>
@@ -60,7 +79,7 @@ function useSearchSafeHover(
       setHovered(false)
 
       // Radix's leave handler focuses the menu surface: same theft.
-      if (searchHoldsFocus(event.currentTarget)) {
+      if (rowMustKeepFocus(event.currentTarget)) {
         event.preventDefault()
         leave?.()
       }
@@ -72,7 +91,7 @@ function useSearchSafeHover(
         return
       }
 
-      const held = searchHoldsFocus(event.currentTarget)
+      const held = rowMustKeepFocus(event.currentTarget)
 
       setHovered(held)
 
@@ -241,6 +260,13 @@ function DropdownMenuContent({
   sideOffset = 4,
   ...props
 }: React.ComponentProps<typeof DropdownMenuPrimitive.Content> & {
+  /**
+   * Radix's modal Content reads this at runtime — it is the FocusScope mount
+   * autofocus, composed before the content focus — but keeps it out of the
+   * public Content props type (its submenu Content does expose it). Passing it
+   * through lets a menu that must leave focus where it is cancel that focus.
+   */
+  onOpenAutoFocus?: (event: Event) => void
   portalContainer?: HTMLElement | null
 }) {
   // An explicit target-owned container supports global menus whose component

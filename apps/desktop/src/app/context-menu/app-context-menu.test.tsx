@@ -1,4 +1,5 @@
 import { cleanup, createEvent, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { useState } from 'react'
 import { MemoryRouter } from 'react-router'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -514,6 +515,213 @@ describe('AppContextMenu', () => {
 
     await waitFor(() => expect(contextMenuEdit).toHaveBeenCalledWith('paste'))
     expect(document.activeElement).toBe(textarea)
+  })
+
+  // A form field paints its selection only while the field itself holds
+  // focus. The menu content is a focus trap whose mount autofocus (and each
+  // row's hover) takes focus away, so the highlight disappears for as long as
+  // the menu is up. It must instead stay in the field. A contenteditable is
+  // different — its selection is a document Range that stays painted — so its
+  // menu keeps the old focus path.
+  describe('form-field menus keep the field focused', () => {
+    function mountRenameDialog() {
+      function RenameDialog() {
+        const [open, setOpen] = useState(true)
+
+        return (
+          <Dialog onOpenChange={setOpen} open={open}>
+            <DialogContent>
+              <DialogTitle>Rename</DialogTitle>
+              <input aria-label="rename" defaultValue="weekly review notes" />
+            </DialogContent>
+          </Dialog>
+        )
+      }
+
+      render(
+        <MemoryRouter>
+          <AppContextMenu />
+          <RenameDialog />
+        </MemoryRouter>
+      )
+
+      const input = screen.getByLabelText('rename') as HTMLInputElement
+
+      input.focus()
+      input.setSelectionRange(0, 7)
+
+      return input
+    }
+
+    const row = (label: string) => screen.getByText(label).closest('[data-slot="dropdown-menu-item"]') as HTMLElement
+
+    it('opens the menu without moving focus or collapsing the selection', async () => {
+      installBridge()
+      const input = mountRenameDialog()
+
+      fireEvent.contextMenu(input)
+
+      await screen.findByText('Select all')
+      expect(document.activeElement).toBe(input)
+      expect(input.selectionStart).toBe(0)
+      expect(input.selectionEnd).toBe(7)
+    })
+
+    it('closes only the menu on Escape, keeping the field focused and selected', async () => {
+      installBridge()
+      const input = mountRenameDialog()
+
+      fireEvent.contextMenu(input)
+      await screen.findByText('Select all')
+
+      fireEvent.keyDown(input, { key: 'Escape' })
+
+      await waitFor(() => expect(screen.queryByText('Select all')).toBeNull())
+      // The dialog's own Escape handler is not on the layer stack while the
+      // menu is the topmost layer: one Escape closes the menu, not both.
+      expect(screen.getByRole('dialog')).toBeTruthy()
+      expect(document.activeElement).toBe(input)
+      expect(input.selectionStart).toBe(0)
+      expect(input.selectionEnd).toBe(7)
+    })
+
+    it('swallows caret, tab and submit keys while the menu is open', async () => {
+      installBridge()
+      const input = mountRenameDialog()
+
+      fireEvent.contextMenu(input)
+      await screen.findByText('Select all')
+
+      const fieldKeyDown = vi.fn()
+
+      input.addEventListener('keydown', fieldKeyDown)
+
+      for (const key of [
+        'ArrowDown',
+        'ArrowUp',
+        'ArrowLeft',
+        'ArrowRight',
+        'Home',
+        'End',
+        'PageUp',
+        'PageDown',
+        'Tab',
+        'Enter'
+      ]) {
+        fireEvent.keyDown(input, { key })
+      }
+
+      expect(fieldKeyDown).not.toHaveBeenCalled()
+      expect(screen.queryByText('Select all')).not.toBeNull()
+      expect(input.selectionStart).toBe(0)
+      expect(input.selectionEnd).toBe(7)
+    })
+
+    it('keeps the field focused when an outside click dismisses the menu', async () => {
+      installBridge()
+      const input = mountRenameDialog()
+
+      fireEvent.contextMenu(input)
+      await screen.findByText('Select all')
+
+      fireEvent.pointerDown(document.body)
+
+      await waitFor(() => expect(screen.queryByText('Select all')).toBeNull())
+      expect(document.activeElement).toBe(input)
+    })
+
+    it('runs Select all against the field and hands focus back', async () => {
+      installBridge()
+      const input = mountRenameDialog()
+
+      fireEvent.contextMenu(input)
+      fireEvent.click(await screen.findByText('Select all'))
+
+      await waitFor(() => {
+        expect(input.selectionStart).toBe(0)
+        expect(input.selectionEnd).toBe('weekly review notes'.length)
+      })
+      expect(document.activeElement).toBe(input)
+      expect(screen.queryByText('Select all')).toBeNull()
+    })
+
+    it('keeps the row highlight on hover without taking focus', async () => {
+      installBridge()
+      const input = mountRenameDialog()
+
+      fireEvent.contextMenu(input)
+      await screen.findByText('Select all')
+
+      const copy = row('Copy')
+
+      fireEvent.pointerMove(copy, { pointerType: 'mouse' })
+      expect(copy.hasAttribute('data-highlighted')).toBe(true)
+      expect(document.activeElement).toBe(input)
+      expect(input.selectionStart).toBe(0)
+      expect(input.selectionEnd).toBe(7)
+
+      fireEvent.pointerLeave(copy, { pointerType: 'mouse' })
+      expect(copy.hasAttribute('data-highlighted')).toBe(false)
+      expect(document.activeElement).toBe(input)
+    })
+
+    it('still takes focus into the menu for a non-editable target', async () => {
+      installBridge()
+      mountMenu()
+      const host = attach('<p>some transcript text</p>')
+
+      fireEvent.contextMenu(host.querySelector('p')!)
+
+      const content = await waitFor(() => {
+        const node = document.querySelector('[data-slot="dropdown-menu-content"]')
+
+        expect(node).not.toBeNull()
+
+        return node as HTMLElement
+      })
+
+      expect(content.contains(document.activeElement)).toBe(true)
+      expect(document.querySelector('[data-context-menu-keep-focus]')).toBeNull()
+    })
+
+    it('leaves a contenteditable menu on the old focus path', async () => {
+      installBridge()
+      mountMenu()
+      const host = attach('<div contenteditable="true" tabindex="0"><span id="draft">alpha beta</span></div>')
+      const editable = host.querySelector('[contenteditable]') as HTMLElement
+      const draft = host.querySelector('#draft') as HTMLElement
+
+      editable.focus()
+      expect(document.activeElement).toBe(editable)
+
+      // jsdom drops the document selection when focus moves, so select after.
+      const range = document.createRange()
+
+      range.selectNodeContents(draft)
+      window.getSelection()!.removeAllRanges()
+      window.getSelection()!.addRange(range)
+
+      fireEvent.contextMenu(draft)
+
+      const content = await waitFor(() => {
+        const node = document.querySelector('[data-slot="dropdown-menu-content"]')
+
+        expect(node).not.toBeNull()
+
+        return node as HTMLElement
+      })
+
+      // The keep-focus gate is form-field only: the composer keeps its
+      // highlight without it and must not gain the keydown guard.
+      expect(document.querySelector('[data-context-menu-keep-focus]')).toBeNull()
+      expect(content.contains(document.activeElement)).toBe(true)
+      // jsdom empties Selection.toString() once focus leaves an editing host
+      // (it keeps the Range), so assert the range itself. Chromium keeps
+      // painting a contenteditable Range with focus elsewhere — the composer
+      // never showed the defect, which is why this path is left alone.
+      expect(window.getSelection()?.rangeCount).toBe(1)
+      expect(range.toString()).toBe('alpha beta')
+    })
   })
 
   it('grays out cut and copy when the field has text but no selection', async () => {
